@@ -401,7 +401,7 @@ for (const kind of testBackends()) describe(`#5530 Git effect coalescing (${kind
     await activateSharedSkillPersistence(engine, { confirmQuiesced: true });
     await seed(ctx('default'), 1);
     const binding = (await getWorktreeBinding(engine, 'default', localHostId()))!;
-    const held = (await acquireWorktree(binding, 0, undefined, engine))!;
+    const held = (await acquireWorktree(binding, 30_000, undefined, engine))!;
     try {
       await submitPageMutation(ctx('default'), { operation: 'put_page', waitMs: 1500,
         params: { slug: 'notes/lock-held', request_id: randomUUID(), content: pageContent(7777) } }).catch(() => undefined);
