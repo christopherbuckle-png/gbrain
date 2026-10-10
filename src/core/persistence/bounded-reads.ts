@@ -83,22 +83,23 @@ export function boundedReads(engine: BrainEngine, clock: ClaimPhaseClock | undef
   } }), viewedEngine(engine));
 }
 
-/** How far past its own bound a session statement may run before the session sets `statement_timeout` again. */
+/** How far a session statement's bound may differ from its own before the session sets `statement_timeout` again. */
 export const BOUNDED_SESSION_SLACK_MS = 25;
 /**
  * GBRA-75 wave 9: runs `fn` with a view of `engine` whose bounded raw reads (`executeRaw` with `timeoutMs`, which
  * `boundedReads` issues) share one transaction on one reserved ordinary-pool connection: `BEGIN` and
  * `SET LOCAL statement_timeout` once, then each read, then `COMMIT` when `fn` settles, instead of a
  * `BEGIN; SET LOCAL; read; COMMIT` per read. The bound stays per statement and server-side: before a read whose own
- * bound is more than BOUNDED_SESSION_SLACK_MS shorter than the one in force, the session sets it again in the same
- * pipeline, so a statement waiting on a relation lock still ends on the server at the budget (within the slack).
+ * bound differs from the one in force by more than BOUNDED_SESSION_SLACK_MS, the session sets it again in the same
+ * pipeline, so a statement waiting on a relation lock still ends on the server at its budget (within the slack).
  * A read that fails ends the transaction (a rollback); reads the failure aborted (25P02) run again in a new one,
  * so each read sees the outcome it would have alone. A read issued after `fn` settled, by a preparation the
  * caller abandoned, takes the per-read path. Unbounded statements and everything else go to `engine`. On PGLite,
- * or when the pool has no long-hold capacity left, `fn` gets `engine` itself.
+ * or when the pool has no long-hold capacity left, `fn` gets `engine` itself; inside a session (a waiver run's,
+ * sync-run.ts `waiveRun`), `fn` joins it.
  */
 export async function withBoundedReadSession<T>(engine: BrainEngine, fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
-  if (engine.kind !== 'postgres') return fn(engine);
+  if (engine.kind !== 'postgres' || sessionViews.has(engine)) return fn(engine);
   let started = false;
   try {
     return await engine.withReservedConnection(async conn => {
@@ -112,6 +113,8 @@ export async function withBoundedReadSession<T>(engine: BrainEngine, fn: (engine
   }
 }
 
+/** Views a session hands out: a screen run inside a waiver run's session joins it instead of opening its own. */
+const sessionViews = new WeakSet<object>();
 class BoundedReadSession {
   readonly view: BrainEngine;
   private open = false;
@@ -125,6 +128,7 @@ class BoundedReadSession {
       const value = Reflect.get(target, key, target);
       return typeof value === 'function' ? value.bind(target) : value;
     } }), viewedEngine(engine));
+    sessionViews.add(this.view);
   }
 
   private async run<T>(sql: string, params: unknown[] | undefined, timeoutMs: number, retries: number): Promise<T[]> {
@@ -137,11 +141,11 @@ class BoundedReadSession {
       steps.push(this.conn.executeRaw('BEGIN'));
       steps.push(this.conn.executeRaw(`SET LOCAL statement_timeout = ${ms}`));
       this.boundMs = ms;
-    } else if (this.boundMs > ms + BOUNDED_SESSION_SLACK_MS || this.boundMs < ms) {
+    } else if (Math.abs(this.boundMs - ms) > BOUNDED_SESSION_SLACK_MS) {
       steps.push(this.conn.executeRaw(`SET LOCAL statement_timeout = ${ms}`));
       this.boundMs = ms;
     }
-    const read = this.conn.executeRaw<T>(sql, params);
+    const read = this.conn.executeRaw<T>(sql, params, { prepare: true });
     const settled = await Promise.allSettled([...steps, read]);
     const failed = settled.find((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
     if (!failed) return (settled[settled.length - 1] as PromiseFulfilledResult<T[]>).value;

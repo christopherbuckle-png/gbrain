@@ -3,7 +3,8 @@
  * screen's bounded reads share. Protects: the reads run on one reserved
  * connection between one `BEGIN; SET LOCAL statement_timeout` and one `COMMIT`;
  * the bound stays per statement on the server (set again once the one in force
- * outlasts a read's own bound by more than the slack); a statement held by a
+ * differs from a read's own bound by more than the slack; a screen inside a
+ * waiver run's session joins it); a statement held by a
  * relation lock ends on the server at its bound with no statement left running;
  * a failed read rolls the transaction back and the reads it aborted (25P02) run
  * again, so each read sees its own outcome; a read after the session closed and
@@ -59,7 +60,7 @@ test('a session runs its bounded reads in one transaction; unbounded statements 
   expect(direct[1]).toEqual({ sql: 'SELECT 5 AS late', timeoutMs: 1000 });
 });
 
-test('the bound in force is set again once it outlasts a read\'s own bound by more than the slack', async () => {
+test('the bound in force is set again once it differs from a read\'s own bound by more than the slack', async () => {
   const { engine, conn } = fakePostgres();
   await withBoundedReadSession(engine, async session => {
     await session.executeRaw('SELECT 1', [], { timeoutMs: 10_000 });
@@ -87,6 +88,22 @@ test('a failed read rolls the transaction back, the reads it aborted run again, 
   });
   expect(conn.filter(sql => /^(BEGIN|ROLLBACK|COMMIT)$/.test(sql))).toEqual(['BEGIN', 'ROLLBACK', 'BEGIN', 'COMMIT']);
   expect(conn.filter(sql => sql === 'SELECT queued')).toHaveLength(2);
+});
+
+test('a screen inside a waiver run\'s session joins it: one transaction for both, reads named as prepared statements', async () => {
+  const { engine, conn } = fakePostgres();
+  const prepared: unknown[] = [];
+  const spy = { ...engine, withReservedConnection: <T>(fn: (c: ReservedConnection) => Promise<T>) => engine.withReservedConnection(c => fn({ executeRaw: (sql: string, params?: unknown[], opts?: { prepare?: boolean }) => {
+    if (!/^(BEGIN|COMMIT|ROLLBACK|SET LOCAL)/.test(sql)) prepared.push(opts?.prepare); return c.executeRaw(sql, params, opts); } } as ReservedConnection)) } as unknown as BrainEngine;
+  let reserved = 0;
+  const counted = new Proxy(spy, { get(target, key) { if (key === 'withReservedConnection') reserved++; return Reflect.get(target, key); } });
+  await withBoundedReadSession(counted, async run => {
+    await run.executeRaw('SELECT 1', [], { timeoutMs: 10_000 });
+    await withBoundedReadSession(run, async screen => { expect(screen).toBe(run); await screen.executeRaw('SELECT 2', [], { timeoutMs: 10_000 }); });
+  });
+  expect(reserved).toBe(1);
+  expect(conn).toEqual(['BEGIN', 'SET LOCAL statement_timeout = 10000', 'SELECT 1', 'SELECT 2', 'COMMIT']);
+  expect(prepared).toEqual([true, true]);
 });
 
 test('PGLite, or a pool with no long-hold capacity, gets the engine itself; an error from inside the session passes through', async () => {
@@ -147,7 +164,7 @@ test('on Postgres: one backend and one transaction per session, each statement b
 const git = (root: string, ...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const OPTS = { noPull: true, noEmbed: true, noExtract: true };
 
-test('a full re-sync\'s waiver screens run their bounded reads on screen sessions, not one bounded transaction per read', () => withEnv({ GBRAIN_HOME: home }, async () => {
+test('a full re-sync\'s waiver screens run their bounded reads on the waiver run\'s session, not one bounded transaction per read', () => withEnv({ GBRAIN_HOME: home }, async () => {
   for (const engine of engines) {
     const id = `brs-${randomUUID().replace(/-/g, '').slice(0, 16)}`, root = join(home, id);
     mkdirSync(root, { recursive: true }); git(root, 'init', '-q');
@@ -168,8 +185,9 @@ test('a full re-sync\'s waiver screens run their bounded reads on screen session
     } });
     try {
       expect(await performManagedSync(counted, { sourceId: id, ...OPTS, full: true })).toMatchObject({ status: 'synced', modified: 0, waived: { imports: 8, deletes: 0 } });
-      // Only the run's checkpoint, which the consumer prepares, reads per statement; each screen took 14 such reads before.
-      if (engine.kind === 'postgres') { expect(perRead).toBeLessThan(8 * 3); expect(sessions).toBeGreaterThanOrEqual(8); }
+      // Only the run's checkpoint, which the consumer prepares, reads per statement (each screen took 14 such reads before),
+      // and the screens of one waiver run share its session.
+      if (engine.kind === 'postgres') { expect(perRead).toBeLessThan(8 * 3); expect(sessions).toBeGreaterThanOrEqual(1); expect(sessions).toBeLessThan(8); }
       else expect(perRead).toBe(0);
     } finally { await disposePersistenceConsumer(counted); }
   }
