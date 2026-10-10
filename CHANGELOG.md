@@ -33,6 +33,7 @@ Efficiency wave 9 (GBRA-75). Base is master at wave 8 (310371559). Measured on 4
 - Tests:
   - `persistence-git-coalescing-5530.slow.test.ts` and its Postgres twin add two cases. A write behind six full groups, sent while one is committing, must publish within the wait with at most the in-flight group ahead of it; this fails on base on both engines. A write that finds the worktree locked is requeued as `writer_busy` with no claim phase.
   - `persistence-bounded-read-session.test.ts` has 7 cases: sequencing, bound refresh, rollback and retry, joining a run's session, prepared reads, the PGLite and no-permit paths, a real lock wait that ends at its bound with nothing left running, and a re-sync. On the re-sync, base runs 101 bounded transactions for 8 files and the branch runs 16.
+  - `managed-sync-foreground-priority.test.ts` (Postgres arm) flake fixed. "a stream of writes from another process" now boots and connects its writer process before the drain starts. Before, the drain's lead depended on how fast a cold process started, so a slow runner could commit most groups before the first write. Forcing a 600 ms boot fails the old test 4 of 4 times and passes the new one 4 of 4.
   - Crash robot: 600 s on each engine, every seam, with PgBouncer and `pooler_disconnect` on Postgres.
 
 ## [0.60.146.0] - 2026-10-10
